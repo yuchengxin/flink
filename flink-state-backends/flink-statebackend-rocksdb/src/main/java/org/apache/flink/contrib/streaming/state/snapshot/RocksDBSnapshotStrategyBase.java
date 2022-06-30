@@ -24,8 +24,12 @@ import org.apache.flink.contrib.streaming.state.RocksDBKeyedStateBackend.RocksDb
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.LocalRecoveryConfig;
+import org.apache.flink.runtime.state.LocalRecoveryDirectoryProvider;
+import org.apache.flink.runtime.state.SnapshotDirectory;
 import org.apache.flink.runtime.state.SnapshotResources;
 import org.apache.flink.runtime.state.SnapshotStrategy;
+import org.apache.flink.util.ExceptionUtils;
+import org.apache.flink.util.FileUtils;
 import org.apache.flink.util.ResourceGuard;
 
 import org.rocksdb.RocksDB;
@@ -35,6 +39,9 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nonnegative;
 import javax.annotation.Nonnull;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 
 /**
@@ -69,6 +76,12 @@ public abstract class RocksDBSnapshotStrategyBase<K, R extends SnapshotResources
     /** The configuration for local recovery. */
     @Nonnull protected final LocalRecoveryConfig localRecoveryConfig;
 
+    /** Base path of the RocksDB instance. */
+    @Nonnull protected final File instanceBasePath;
+
+    /** The local directory name of the current snapshot strategy. */
+    protected final String localDirectoryName;
+
     public RocksDBSnapshotStrategyBase(
             @Nonnull String description,
             @Nonnull RocksDB db,
@@ -77,7 +90,9 @@ public abstract class RocksDBSnapshotStrategyBase<K, R extends SnapshotResources
             @Nonnull LinkedHashMap<String, RocksDbKvStateInfo> kvStateInformation,
             @Nonnull KeyGroupRange keyGroupRange,
             @Nonnegative int keyGroupPrefixBytes,
-            @Nonnull LocalRecoveryConfig localRecoveryConfig) {
+            @Nonnull LocalRecoveryConfig localRecoveryConfig,
+            @Nonnull File instanceBasePath,
+            @Nonnull String localDirectoryName) {
         this.db = db;
         this.rocksDBResourceGuard = rocksDBResourceGuard;
         this.keySerializer = keySerializer;
@@ -86,11 +101,61 @@ public abstract class RocksDBSnapshotStrategyBase<K, R extends SnapshotResources
         this.keyGroupPrefixBytes = keyGroupPrefixBytes;
         this.localRecoveryConfig = localRecoveryConfig;
         this.description = description;
+        this.instanceBasePath = instanceBasePath;
+        this.localDirectoryName = localDirectoryName;
     }
 
     @Nonnull
     public String getDescription() {
         return description;
+    }
+
+    @Nonnull
+    protected SnapshotDirectory prepareLocalSnapshotDirectory(long checkpointId)
+            throws IOException {
+
+        if (localRecoveryConfig.isLocalRecoveryEnabled()) {
+            // create a "permanent" snapshot directory for local recovery.
+            LocalRecoveryDirectoryProvider directoryProvider =
+                    localRecoveryConfig
+                            .getLocalStateDirectoryProvider()
+                            .orElseThrow(LocalRecoveryConfig.localRecoveryNotEnabled());
+            File directory = directoryProvider.subtaskSpecificCheckpointDirectory(checkpointId);
+
+            if (!directory.exists() && !directory.mkdirs()) {
+                throw new IOException(
+                        "Local state base directory for checkpoint "
+                                + checkpointId
+                                + " does not exist and could not be created: "
+                                + directory);
+            }
+
+            // introduces an extra directory because RocksDB wants a non-existing directory for
+            // native checkpoints.
+            // append localDirectoryName here to solve directory collision problem when two stateful
+            // operators chained in one task.
+            File rdbSnapshotDir = new File(directory, localDirectoryName);
+            if (rdbSnapshotDir.exists()) {
+                FileUtils.deleteDirectory(rdbSnapshotDir);
+            }
+
+            Path path = rdbSnapshotDir.toPath();
+            // create a "permanent" snapshot directory because local recovery is active.
+            try {
+                return SnapshotDirectory.permanent(path);
+            } catch (IOException ex) {
+                try {
+                    FileUtils.deleteDirectory(directory);
+                } catch (IOException delEx) {
+                    ex = ExceptionUtils.firstOrSuppressed(delEx, ex);
+                }
+                throw ex;
+            }
+        } else {
+            // create a "temporary" snapshot directory because local recovery is inactive.
+            File snapshotDir = new File(instanceBasePath, "chk-" + checkpointId);
+            return SnapshotDirectory.temporary(snapshotDir);
+        }
     }
 
     @Override

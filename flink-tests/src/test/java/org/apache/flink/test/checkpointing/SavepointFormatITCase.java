@@ -122,11 +122,7 @@ public class SavepointFormatITCase extends TestLogger {
 
     private void validateNativeNonChangelogState(
             KeyedStateHandle state, StateBackendConfig backendConfig) {
-        if (backendConfig.isIncremental()) {
-            assertThat(state, instanceOf(IncrementalRemoteKeyedStateHandle.class));
-        } else {
-            assertThat(state, instanceOf(KeyGroupsStateHandle.class));
-        }
+        assertThat(state, instanceOf(IncrementalRemoteKeyedStateHandle.class));
     }
 
     private abstract static class StateBackendConfig {
