@@ -91,7 +91,10 @@
         },
         "watermarkParams":{
          "emitStrategy" : "ON_PERIODIC",
-         "emitOnEventGap" : 1
+         "emitOnEventGap" : 1,
+         "alignGroupName" : null,
+         "alignMaxDrift" : "PT0S",
+         "alignUpdateInterval" : "PT1S"
         }
       } ]
     },
