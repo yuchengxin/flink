@@ -40,6 +40,7 @@ import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.module.Module;
 import org.apache.flink.table.utils.EncodingUtils;
+import org.apache.flink.table.watermark.WatermarkEmitStrategy;
 import org.apache.flink.util.Preconditions;
 
 import org.slf4j.Logger;
@@ -117,6 +118,24 @@ public final class FactoryUtil {
                     .defaultValues("rest")
                     .withDescription("Specify the endpoints that are used.");
 
+    public static final ConfigOption<WatermarkEmitStrategy> WATERMARK_EMIT_STRATEGY =
+            ConfigOptions.key("scan.watermark.emit.strategy")
+                    .enumType(WatermarkEmitStrategy.class)
+                    .defaultValue(WatermarkEmitStrategy.ON_PERIODIC)
+                    .withDescription(
+                            "The strategy for emitting watermark. "
+                                    + "'on-event' means emitting watermark based on the number of events. "
+                                    + "'on-periodic' means emitting watermark periodically. "
+                                    + "The default strategy is 'on-periodic'");
+
+    public static final ConfigOption<Integer> WATERMARK_EMIT_ON_EVENT_GAP =
+            ConfigOptions.key("scan.watermark.emit.on-event.gap")
+                    .intType()
+                    .defaultValue(1)
+                    .withDescription(
+                            "The gap for emitting watermark when emit-strategy is 'ON_EVENT'. "
+                                    + "It's means streaming engine will emit a watermark every n(n > 0) events");
+
     /**
      * Suffix for keys of {@link ConfigOption} in case a connector requires multiple formats (e.g.
      * for both key and value).
@@ -131,6 +150,15 @@ public final class FactoryUtil {
      * Factory} for details.
      */
     public static final String PLACEHOLDER_SYMBOL = "#";
+
+    private static final Set<ConfigOption<?>> watermarkOptionSet;
+
+    static {
+        Set<ConfigOption<?>> set = new HashSet<>();
+        set.add(WATERMARK_EMIT_STRATEGY);
+        set.add(WATERMARK_EMIT_ON_EVENT_GAP);
+        watermarkOptionSet = Collections.unmodifiableSet(set);
+    }
 
     /**
      * Creates a {@link DynamicTableSource} from a {@link CatalogTable}.
@@ -925,6 +953,7 @@ public final class FactoryUtil {
                     allOptions.keySet(),
                     consumedOptionKeys,
                     deprecatedOptionKeys);
+            validateWatermarkOptions(factory.factoryIdentifier(), allOptions);
         }
 
         /**
@@ -1001,6 +1030,8 @@ public final class FactoryUtil {
             this.context = context;
             this.enrichingOptions = Configuration.fromMap(context.getEnrichmentOptions());
             this.forwardOptions();
+            this.consumedOptionKeys.addAll(
+                    watermarkOptionSet.stream().map(ConfigOption::key).collect(Collectors.toSet()));
         }
 
         /**
@@ -1337,5 +1368,44 @@ public final class FactoryUtil {
 
     private FactoryUtil() {
         // no instantiation
+    }
+
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Validate watermark options from table options.
+     *
+     * @param factoryIdentifier identifier of table
+     * @param conf table options
+     */
+    public static void validateWatermarkOptions(String factoryIdentifier, ReadableConfig conf) {
+        Optional<String> errMsgOptional = checkWatermarkOptions(conf);
+        if (errMsgOptional.isPresent()) {
+            throw new ValidationException(
+                    String.format(
+                            "Error configuring watermark for '%s', %s",
+                            factoryIdentifier, errMsgOptional.get()));
+        }
+    }
+
+    /**
+     * Check watermark-related options and return error messages.
+     *
+     * @param conf table options
+     * @return Optional of error messages
+     */
+    public static Optional<String> checkWatermarkOptions(ReadableConfig conf) {
+        // try to validate watermark options by parsing it
+        watermarkOptionSet.forEach(option -> readOption(conf, option));
+        // check watermark strategy
+        Optional<Integer> emitGapOptional = conf.getOptional(WATERMARK_EMIT_ON_EVENT_GAP);
+        if (emitGapOptional.isPresent() && emitGapOptional.get() <= 0) {
+            String errMsg =
+                    String.format(
+                            "the value of '%s' must be positive.",
+                            WATERMARK_EMIT_ON_EVENT_GAP.key());
+            return Optional.of(errMsg);
+        }
+        return Optional.empty();
     }
 }

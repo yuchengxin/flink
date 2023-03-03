@@ -20,6 +20,8 @@ package org.apache.flink.table.planner.plan.rules.logical;
 
 import org.apache.flink.api.common.eventtime.WatermarkGeneratorSupplier;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.configuration.ConfigOption;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.api.config.ExecutionConfigOptions;
 import org.apache.flink.table.catalog.ResolvedSchema;
@@ -31,6 +33,7 @@ import org.apache.flink.table.expressions.ResolvedExpression;
 import org.apache.flink.table.functions.BuiltInFunctionDefinitions;
 import org.apache.flink.table.functions.FunctionDefinition;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory;
+import org.apache.flink.table.planner.hint.FlinkHints;
 import org.apache.flink.table.planner.plan.abilities.source.SourceAbilityContext;
 import org.apache.flink.table.planner.plan.abilities.source.SourceAbilitySpec;
 import org.apache.flink.table.planner.plan.abilities.source.SourceWatermarkSpec;
@@ -39,15 +42,22 @@ import org.apache.flink.table.planner.plan.nodes.logical.FlinkLogicalTableSource
 import org.apache.flink.table.planner.plan.nodes.logical.FlinkLogicalWatermarkAssigner;
 import org.apache.flink.table.planner.plan.schema.TableSourceTable;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.table.watermark.WatermarkParams;
 
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleOperand;
+import org.apache.calcite.plan.RelOptTable;
+import org.apache.calcite.rel.hint.RelHint;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexNode;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
+import static org.apache.flink.table.factories.FactoryUtil.WATERMARK_EMIT_ON_EVENT_GAP;
+import static org.apache.flink.table.factories.FactoryUtil.WATERMARK_EMIT_STRATEGY;
 import static org.apache.flink.table.planner.utils.ShortcutUtils.unwrapFunctionDefinition;
 
 /**
@@ -117,8 +127,37 @@ public abstract class PushWatermarkIntoTableSourceScanRuleBase extends RelOptRul
                 idleTimeoutMillis = -1L;
             }
 
+            Optional<RelHint> optionsHintOptional =
+                    scan.getHints().stream()
+                            .filter(
+                                    relHint ->
+                                            relHint.hintName.equalsIgnoreCase(
+                                                    FlinkHints.HINT_NAME_OPTIONS))
+                            .findFirst();
+            Configuration hintOptions = new Configuration();
+            if (optionsHintOptional.isPresent()) {
+                RelHint optionsHint = optionsHintOptional.get();
+                hintOptions = Configuration.fromMap(optionsHint.kvOptions);
+            }
+            Configuration tableOptions = new Configuration();
+            RelOptTable table = scan.getTable();
+            if (table instanceof TableSourceTable) {
+                Map<String, String> tableConfigs =
+                        ((TableSourceTable) table)
+                                .contextResolvedTable()
+                                .getResolvedTable()
+                                .getOptions();
+                tableOptions = Configuration.fromMap(tableConfigs);
+            }
+            Optional<WatermarkParams> watermarkParamsOptional =
+                    parseWatermarkParams(hintOptions, tableOptions);
+
             final WatermarkPushDownSpec watermarkPushDownSpec =
-                    new WatermarkPushDownSpec(watermarkExpr, idleTimeoutMillis, producedType);
+                    new WatermarkPushDownSpec(
+                            watermarkExpr,
+                            idleTimeoutMillis,
+                            producedType,
+                            watermarkParamsOptional.orElse(null));
             watermarkPushDownSpec.apply(newDynamicTableSource, abilityContext);
             abilitySpec = watermarkPushDownSpec;
         }
@@ -156,5 +195,21 @@ public abstract class PushWatermarkIntoTableSourceScanRuleBase extends RelOptRul
     private boolean hasSourceWatermarkDeclaration(RexNode rexNode) {
         final FunctionDefinition function = unwrapFunctionDefinition(rexNode);
         return function == BuiltInFunctionDefinitions.SOURCE_WATERMARK;
+    }
+
+    private Optional<WatermarkParams> parseWatermarkParams(
+            Configuration hintOptions, Configuration tableOptions) {
+        WatermarkParams.WatermarkParamsBuilder builder = WatermarkParams.builder();
+        getOptions(WATERMARK_EMIT_STRATEGY, hintOptions, tableOptions)
+                .ifPresent(builder::emitStrategy);
+        getOptions(WATERMARK_EMIT_ON_EVENT_GAP, hintOptions, tableOptions)
+                .ifPresent(builder::emitOnEventGap);
+        return Optional.of(builder.build());
+    }
+
+    private <T> Optional<T> getOptions(
+            ConfigOption<T> option, Configuration priorityOptions, Configuration secondOptions) {
+        Optional<T> result = priorityOptions.getOptional(option);
+        return result.isPresent() ? result : secondOptions.getOptional(option);
     }
 }

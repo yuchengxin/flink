@@ -24,6 +24,8 @@ import org.apache.flink.api.common.eventtime.WatermarkGeneratorSupplier;
 import org.apache.flink.api.common.eventtime.WatermarkOutput;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.watermark.WatermarkEmitStrategy;
+import org.apache.flink.table.watermark.WatermarkParams;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -40,10 +42,13 @@ public class GeneratedWatermarkGeneratorSupplier implements WatermarkGeneratorSu
     private static final long serialVersionUID = 1L;
 
     private final GeneratedWatermarkGenerator generatedWatermarkGenerator;
+    private final WatermarkParams watermarkParams;
 
     public GeneratedWatermarkGeneratorSupplier(
-            GeneratedWatermarkGenerator generatedWatermarkGenerator) {
+            GeneratedWatermarkGenerator generatedWatermarkGenerator,
+            WatermarkParams watermarkParams) {
         this.generatedWatermarkGenerator = generatedWatermarkGenerator;
+        this.watermarkParams = watermarkParams;
     }
 
     @Override
@@ -66,8 +71,11 @@ public class GeneratedWatermarkGeneratorSupplier implements WatermarkGeneratorSu
         } catch (Exception e) {
             throw new RuntimeException("Fail to instantiate generated watermark generator.", e);
         }
+
+        WatermarkEmitStrategy watermarkEmitStrategy = watermarkParams.getEmitStrategy();
+        int eventGap = watermarkParams.getEmitOnEventGap();
         return new GeneratedWatermarkGeneratorSupplier.DefaultWatermarkGenerator(
-                innerWatermarkGenerator);
+                innerWatermarkGenerator, watermarkEmitStrategy, eventGap);
     }
 
     /** Wrapper of the code-generated {@link WatermarkGenerator}. */
@@ -76,10 +84,18 @@ public class GeneratedWatermarkGeneratorSupplier implements WatermarkGeneratorSu
         private static final long serialVersionUID = 1L;
 
         private final WatermarkGenerator innerWatermarkGenerator;
+        private final org.apache.flink.table.watermark.WatermarkEmitStrategy watermarkEmitStrategy;
         private Long currentWatermark = Long.MIN_VALUE;
+        private int eventCounter;
+        private final int eventGap;
 
-        public DefaultWatermarkGenerator(WatermarkGenerator watermarkGenerator) {
+        public DefaultWatermarkGenerator(
+                WatermarkGenerator watermarkGenerator,
+                org.apache.flink.table.watermark.WatermarkEmitStrategy watermarkEmitStrategy,
+                int eventGap) {
             this.innerWatermarkGenerator = watermarkGenerator;
+            this.watermarkEmitStrategy = watermarkEmitStrategy;
+            this.eventGap = eventGap;
         }
 
         @Override
@@ -88,6 +104,13 @@ public class GeneratedWatermarkGeneratorSupplier implements WatermarkGeneratorSu
                 Long watermark = innerWatermarkGenerator.currentWatermark(event);
                 if (watermark != null) {
                     currentWatermark = watermark;
+                }
+                if (watermarkEmitStrategy.isOnEvent()) {
+                    eventCounter++;
+                    if (eventCounter >= eventGap) {
+                        output.emitWatermark(new Watermark(currentWatermark));
+                        eventCounter = 0;
+                    }
                 }
             } catch (Exception e) {
                 throw new RuntimeException(
@@ -100,7 +123,9 @@ public class GeneratedWatermarkGeneratorSupplier implements WatermarkGeneratorSu
 
         @Override
         public void onPeriodicEmit(WatermarkOutput output) {
-            output.emitWatermark(new Watermark(currentWatermark));
+            if (watermarkEmitStrategy.isOnPeriodic()) {
+                output.emitWatermark(new Watermark(currentWatermark));
+            }
         }
     }
 }
