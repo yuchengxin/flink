@@ -100,9 +100,10 @@ public final class WatermarkPushDownSpec extends SourceAbilitySpecBase {
                                 watermarkParams.getAlignMaxDrift(),
                                 watermarkParams.getAlignUpdateInterval());
             }
-            if (idleTimeoutMillis > 0) {
+            long actualIdleTimeoutMillis = calculateIdleTimeoutMillis();
+            if (actualIdleTimeoutMillis > 0) {
                 watermarkStrategy =
-                        watermarkStrategy.withIdleness(Duration.ofMillis(idleTimeoutMillis));
+                        watermarkStrategy.withIdleness(Duration.ofMillis(actualIdleTimeoutMillis));
             }
             ((SupportsWatermarkPushDown) tableSource).applyWatermark(watermarkStrategy);
         } else {
@@ -121,8 +122,9 @@ public final class WatermarkPushDownSpec extends SourceAbilitySpecBase {
                         JavaScalaConversionUtil.toScala(
                                 context.getSourceRowType().getFieldNames()));
         String digest = String.format("watermark=[%s]", expressionStr);
-        if (idleTimeoutMillis > 0) {
-            digest = String.format("%s, idletimeout=[%d]", digest, idleTimeoutMillis);
+        long actualIdleTimeoutMillis = calculateIdleTimeoutMillis();
+        if (actualIdleTimeoutMillis > 0) {
+            digest = String.format("%s, idletimeout=[%d]", digest, actualIdleTimeoutMillis);
         }
         if (watermarkParams != null) {
             WatermarkEmitStrategy emitStrategy = watermarkParams.getEmitStrategy();
@@ -164,5 +166,13 @@ public final class WatermarkPushDownSpec extends SourceAbilitySpecBase {
     @Override
     public int hashCode() {
         return Objects.hash(super.hashCode(), watermarkExpr, idleTimeoutMillis);
+    }
+
+    private long calculateIdleTimeoutMillis() {
+        long actualIdleTimeoutMillis = idleTimeoutMillis;
+        if (watermarkParams != null && watermarkParams.getSourceIdleTimeout() > 0) {
+            actualIdleTimeoutMillis = watermarkParams.getSourceIdleTimeout();
+        }
+        return actualIdleTimeoutMillis;
     }
 }

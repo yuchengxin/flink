@@ -56,6 +56,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.apache.flink.table.factories.FactoryUtil.SOURCE_IDLE_TIMEOUT;
 import static org.apache.flink.table.factories.FactoryUtil.WATERMARK_ALIGNMENT_GROUP;
 import static org.apache.flink.table.factories.FactoryUtil.WATERMARK_ALIGNMENT_MAX_DRIFT;
 import static org.apache.flink.table.factories.FactoryUtil.WATERMARK_ALIGNMENT_UPDATE_INTERVAL;
@@ -213,6 +214,8 @@ public abstract class PushWatermarkIntoTableSourceScanRuleBase extends RelOptRul
                 .ifPresent(builder::alignMaxDrift);
         getOptions(WATERMARK_ALIGNMENT_UPDATE_INTERVAL, hintOptions, tableOptions)
                 .ifPresent(builder::alignUpdateInterval);
+        getOptions(SOURCE_IDLE_TIMEOUT, hintOptions, tableOptions)
+                .ifPresent(timeout -> builder.sourceIdleTimeout(timeout.toMillis()));
         return Optional.of(builder.build());
     }
 

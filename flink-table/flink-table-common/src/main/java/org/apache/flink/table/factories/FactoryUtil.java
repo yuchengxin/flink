@@ -155,6 +155,17 @@ public final class FactoryUtil {
                     .defaultValue(Duration.ofMillis(1000))
                     .withDescription("update interval to align watermark.");
 
+    public static final ConfigOption<Duration> SOURCE_IDLE_TIMEOUT =
+            ConfigOptions.key("scan.idle-timeout")
+                    .durationType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "When a source do not receive any elements for the timeout time, "
+                                    + "it will be marked as temporarily idle. This allows downstream "
+                                    + "tasks to advance their watermarks without the need to wait for "
+                                    + "watermarks from this source while it is idle. "
+                                    + "Default value is 0, which means detecting source idleness is not enabled.");
+
     /**
      * Suffix for keys of {@link ConfigOption} in case a connector requires multiple formats (e.g.
      * for both key and value).
@@ -179,6 +190,7 @@ public final class FactoryUtil {
         set.add(WATERMARK_ALIGNMENT_GROUP);
         set.add(WATERMARK_ALIGNMENT_MAX_DRIFT);
         set.add(WATERMARK_ALIGNMENT_UPDATE_INTERVAL);
+        set.add(SOURCE_IDLE_TIMEOUT);
         watermarkOptionSet = Collections.unmodifiableSet(set);
     }
 

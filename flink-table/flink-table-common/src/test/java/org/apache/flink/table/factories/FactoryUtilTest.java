@@ -190,6 +190,7 @@ class FactoryUtilTest {
                         + "key.test-format.readable-metadata\n"
                         + "password\n"
                         + "property-version\n"
+                        + "scan.idle-timeout\n"
                         + "scan.watermark.alignment.group\n"
                         + "scan.watermark.alignment.max-drift\n"
                         + "scan.watermark.alignment.update-interval\n"
@@ -745,6 +746,7 @@ class FactoryUtilTest {
         options.put("scan.watermark.alignment.group", "group1");
         options.put("scan.watermark.alignment.max-drift", "1min");
         options.put("scan.watermark.alignment.update-interval", "1s");
+        options.put("scan.idle-timeout", "1min");
         return options;
     }
 

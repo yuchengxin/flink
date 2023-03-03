@@ -17,6 +17,7 @@ public class WatermarkParams implements Serializable {
     private String alignGroupName;
     private Duration alignMaxDrift;
     private Duration alignUpdateInterval;
+    private long sourceIdleTimeout;
 
     public WatermarkParams() {}
 
@@ -25,12 +26,14 @@ public class WatermarkParams implements Serializable {
             int emitOnEventGap,
             String alignGroupName,
             Duration alignMaxDrift,
-            Duration alignUpdateInterval) {
+            Duration alignUpdateInterval,
+            long sourceIdleTimeout) {
         this.emitStrategy = emitStrategy;
         this.emitOnEventGap = emitOnEventGap;
         this.alignGroupName = alignGroupName;
         this.alignMaxDrift = alignMaxDrift;
         this.alignUpdateInterval = alignUpdateInterval;
+        this.sourceIdleTimeout = sourceIdleTimeout;
     }
 
     public WatermarkEmitStrategy getEmitStrategy() {
@@ -73,6 +76,14 @@ public class WatermarkParams implements Serializable {
         this.alignUpdateInterval = alignUpdateInterval;
     }
 
+    public long getSourceIdleTimeout() {
+        return sourceIdleTimeout;
+    }
+
+    public void setSourceIdleTimeout(long sourceIdleTimeout) {
+        this.sourceIdleTimeout = sourceIdleTimeout;
+    }
+
     public boolean alignWatermarkEnabled() {
         return !StringUtils.isNullOrWhitespaceOnly(alignGroupName)
                 && alignMaxDrift != null
@@ -103,6 +114,8 @@ public class WatermarkParams implements Serializable {
                 + alignMaxDrift
                 + ", alignUpdateInterval="
                 + alignUpdateInterval
+                + ", sourceIdleTimeout="
+                + sourceIdleTimeout
                 + '}';
     }
 
@@ -115,6 +128,7 @@ public class WatermarkParams implements Serializable {
         private Duration alignMaxDrift = Duration.ZERO;
         private Duration alignUpdateInterval =
                 FactoryUtil.WATERMARK_ALIGNMENT_UPDATE_INTERVAL.defaultValue();
+        private long sourceIdleTimeout = -1;
 
         public WatermarkParamsBuilder emitStrategy(WatermarkEmitStrategy emitStrategy) {
             this.emitStrategy = emitStrategy;
@@ -141,13 +155,19 @@ public class WatermarkParams implements Serializable {
             return this;
         }
 
+        public WatermarkParamsBuilder sourceIdleTimeout(long sourceIdleTimeout) {
+            this.sourceIdleTimeout = sourceIdleTimeout;
+            return this;
+        }
+
         public WatermarkParams build() {
             return new WatermarkParams(
                     emitStrategy,
                     emitOnEventGap,
                     alignGroupName,
                     alignMaxDrift,
-                    alignUpdateInterval);
+                    alignUpdateInterval,
+                    sourceIdleTimeout);
         }
     }
 }
