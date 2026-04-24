@@ -100,7 +100,7 @@ object LookupJoinCodeGenerator {
       lookupKeys: util.List[FunctionParam],
       asyncLookupFunction: AsyncTableFunction[_],
       functionName: String): GeneratedTableFunctionWithDataType[AsyncFunction[RowData, AnyRef]] = {
-    FunctionCallCodeGenerator.generateAsyncFunctionCall(
+    FunctionCallCodeGenerator.generateAsyncFunctionTimeoutCall(
       tableConfig,
       classLoader,
       dataTypeFactory,
@@ -109,7 +109,7 @@ object LookupJoinCodeGenerator {
       returnType,
       lookupKeys,
       asyncLookupFunction,
-      generateCallWithDataType(
+      generateCallWithTimeoutAndDataType(
         dataTypeFactory,
         functionName,
         tableSourceType,
@@ -167,6 +167,50 @@ object LookupJoinCodeGenerator {
     } catch {
       case e: Exception =>
         inferCallWithDataType(ctx, callContext, udf, operands, legacy = true, e)
+    }
+  }
+
+  private def generateCallWithTimeoutAndDataType(
+      dataTypeFactory: DataTypeFactory,
+      functionName: String,
+      tableSourceType: LogicalType,
+      baseClass: Class[_]
+  ) = (
+      ctx: CodeGeneratorContext,
+      callContext: FunctionCallContext,
+      udf: UserDefinedFunction,
+      operands: Seq[GeneratedExpression]) => {
+    def inferCallWithTimeoutAndDataType(
+        ctx: CodeGeneratorContext,
+        callContext: FunctionCallContext,
+        udf: UserDefinedFunction,
+        operands: Seq[GeneratedExpression],
+        legacy: Boolean,
+        e: Exception = null): (GeneratedExpression, Option[GeneratedExpression], DataType) = {
+      val inference = createLookupTypeInference(
+        dataTypeFactory,
+        callContext,
+        baseClass,
+        udf,
+        functionName,
+        legacy,
+        e)
+      BridgingFunctionGenUtil.generateFunctionAwareCallWithDataTypeAndTimeout(
+        ctx,
+        operands,
+        tableSourceType,
+        inference,
+        callContext,
+        udf,
+        functionName,
+        skipIfArgsNull = true)
+    }
+
+    try {
+      inferCallWithTimeoutAndDataType(ctx, callContext, udf, operands, legacy = false)
+    } catch {
+      case e: Exception =>
+        inferCallWithTimeoutAndDataType(ctx, callContext, udf, operands, legacy = true, e)
     }
   }
 

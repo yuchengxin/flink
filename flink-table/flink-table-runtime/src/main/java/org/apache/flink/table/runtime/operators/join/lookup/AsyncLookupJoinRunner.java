@@ -43,6 +43,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** The async join runner to lookup the dimension table. */
 public class AsyncLookupJoinRunner extends AbstractAsyncFunctionRunner<Object> {
@@ -124,6 +125,9 @@ public class AsyncLookupJoinRunner extends AbstractAsyncFunctionRunner<Object> {
     @Override
     public void asyncInvoke(RowData input, ResultFuture<RowData> resultFuture) throws Exception {
         JoinedRowResultFuture outResultFuture = resultFutureBuffer.take();
+        if (!outResultFuture.inuse.compareAndSet(false, true)) {
+            throw new IllegalStateException();
+        }
         // the input row is copied when object reuse in AsyncWaitOperator
         outResultFuture.reset(input, resultFuture);
 
@@ -142,6 +146,50 @@ public class AsyncLookupJoinRunner extends AbstractAsyncFunctionRunner<Object> {
         FunctionUtils.setFunctionRuntimeContext(resultFuture, getRuntimeContext());
         FunctionUtils.openFunction(resultFuture, DefaultOpenContext.INSTANCE);
         return resultFuture;
+    }
+
+    @Override
+    public void timeout(RowData input, ResultFuture<RowData> resultFuture) throws Exception {
+        // Find and discard the in-flight future bound to this input row so that any late
+        // completion from the underlying fetcher is ignored. The generated fetcher's own
+        // timeout method (rendered when the user UDF provides one) decides how to complete
+        // the new outResultFuture below; if no user timeout method is present, the default
+        // AsyncFunction.timeout raises a TimeoutException as before.
+        //
+        // Reference equality on leftRow is intentional: AsyncWaitOperator passes the same
+        // RowData instance to both asyncInvoke and timeout for a given record (the operator
+        // already deep-copies under object reuse).
+        JoinedRowResultFuture currentFuture = null;
+        for (JoinedRowResultFuture f : allResultFutures) {
+            if (f.leftRow == input) {
+                currentFuture = f;
+                break;
+            }
+        }
+        if (currentFuture == null || !currentFuture.inuse.compareAndSet(true, false)) {
+            // current future is already completed and reused
+            return;
+        }
+        allResultFutures.remove(currentFuture);
+        currentFuture.close();
+
+        // Route through join pipeline via new JoinedRowResultFuture
+        JoinedRowResultFuture outResultFuture =
+                new JoinedRowResultFuture(
+                        resultFutureBuffer,
+                        createFetcherResultFuture(new Configuration()),
+                        fetcherConverter,
+                        isLeftOuterJoin,
+                        rightRowSerializer.getArity());
+        outResultFuture.inuse.set(true);
+        outResultFuture.reset(input, resultFuture);
+        allResultFutures.add(outResultFuture);
+
+        try {
+            fetcher.timeout(input, outResultFuture);
+        } catch (Throwable t) {
+            outResultFuture.completeExceptionally(t);
+        }
     }
 
     @Override
@@ -181,12 +229,14 @@ public class AsyncLookupJoinRunner extends AbstractAsyncFunctionRunner<Object> {
      */
     private static final class JoinedRowResultFuture implements ResultFuture<Object> {
 
+        private final AtomicBoolean inuse = new AtomicBoolean(false);
+
         private final BlockingQueue<JoinedRowResultFuture> resultFutureBuffer;
         private final TableFunctionResultFuture<RowData> joinConditionResultFuture;
         private final DataStructureConverter<RowData, Object> resultConverter;
         private final boolean isLeftOuterJoin;
 
-        private final DelegateResultFuture delegate;
+        private final DelegateResultFuture<RowData> delegate;
         private final GenericRowData nullRow;
 
         private RowData leftRow;
@@ -202,7 +252,7 @@ public class AsyncLookupJoinRunner extends AbstractAsyncFunctionRunner<Object> {
             this.joinConditionResultFuture = joinConditionResultFuture;
             this.resultConverter = resultConverter;
             this.isLeftOuterJoin = isLeftOuterJoin;
-            this.delegate = new DelegateResultFuture();
+            this.delegate = new DelegateResultFuture<>();
             this.nullRow = new GenericRowData(rightArity);
         }
 
@@ -217,6 +267,10 @@ public class AsyncLookupJoinRunner extends AbstractAsyncFunctionRunner<Object> {
         @Override
         @SuppressWarnings({"unchecked", "rawtypes"})
         public void complete(Collection<Object> result) {
+            if (!inuse.compareAndSet(true, false)) {
+                return;
+            }
+
             Collection<RowData> rowDataCollection;
             if (resultConverter.isIdentityConversion()) {
                 rowDataCollection = (Collection) result;
@@ -231,9 +285,14 @@ public class AsyncLookupJoinRunner extends AbstractAsyncFunctionRunner<Object> {
             // the filtered result will be routed to the delegateCollector
             try {
                 joinConditionResultFuture.complete(rowDataCollection);
+                if (delegate.isCompletedExceptionally) {
+                    // inuse is changed, this.completeExceptionally should not be called by delegate
+                    realOutput.completeExceptionally(delegate.error);
+                    return;
+                }
             } catch (Throwable t) {
                 // we should catch the exception here to let the framework know
-                completeExceptionally(t);
+                realOutput.completeExceptionally(t);
                 return;
             }
 
@@ -258,12 +317,15 @@ public class AsyncLookupJoinRunner extends AbstractAsyncFunctionRunner<Object> {
                 // again before outRows in the collector is not consumed.
                 resultFutureBuffer.put(this);
             } catch (InterruptedException e) {
-                completeExceptionally(e);
+                realOutput.completeExceptionally(e);
             }
         }
 
         @Override
         public void completeExceptionally(Throwable error) {
+            if (!inuse.compareAndSet(true, false)) {
+                return;
+            }
             realOutput.completeExceptionally(error);
         }
 
@@ -279,33 +341,40 @@ public class AsyncLookupJoinRunner extends AbstractAsyncFunctionRunner<Object> {
         public void close() throws Exception {
             joinConditionResultFuture.close();
         }
+    }
 
-        private final class DelegateResultFuture implements ResultFuture<RowData> {
+    private static final class DelegateResultFuture<T> implements ResultFuture<T> {
 
-            private Collection<RowData> collection;
+        private Collection<T> collection;
+        private boolean isCompletedExceptionally = false;
+        private Throwable error;
 
-            public void reset() {
-                this.collection = null;
-            }
+        private DelegateResultFuture() {}
 
-            @Override
-            public void complete(Collection<RowData> result) {
-                this.collection = result;
-            }
+        public void reset() {
+            this.collection = null;
+            this.error = null;
+            this.isCompletedExceptionally = false;
+        }
 
-            @Override
-            public void completeExceptionally(Throwable error) {
-                JoinedRowResultFuture.this.completeExceptionally(error);
-            }
+        @Override
+        public void complete(Collection<T> result) {
+            this.collection = result;
+        }
 
-            /**
-             * Unsupported, because the containing classes are AsyncFunctions which don't have
-             * access to the mailbox to invoke from the caller thread.
-             */
-            @Override
-            public void complete(CollectionSupplier<RowData> supplier) {
-                throw new UnsupportedOperationException();
-            }
+        @Override
+        public void completeExceptionally(Throwable error) {
+            this.isCompletedExceptionally = true;
+            this.error = error;
+        }
+
+        /**
+         * Unsupported, because the containing classes are AsyncFunctions which don't have access to
+         * the mailbox to invoke from the caller thread.
+         */
+        @Override
+        public void complete(CollectionSupplier<T> supplier) {
+            throw new UnsupportedOperationException();
         }
     }
 }

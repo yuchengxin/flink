@@ -22,15 +22,23 @@ import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.streaming.api.functions.async.AsyncFunction;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.FunctionKind;
+import org.apache.flink.table.planner.codegen.calls.BridgingFunctionGenUtil;
 import org.apache.flink.table.planner.functions.bridging.BridgingSqlFunction;
 import org.apache.flink.table.planner.utils.JavaScalaConversionUtil;
 import org.apache.flink.table.runtime.generated.GeneratedFunction;
+import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.RowType;
 
 import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexVisitorImpl;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
+
+import scala.Option;
+import scala.Tuple3;
 
 /**
  * Generates an {@link AsyncFunction} which can be used to evaluate correlate invocations from an
@@ -46,20 +54,22 @@ public class AsyncCorrelateCodeGenerator {
             ReadableConfig tableConfig,
             ClassLoader classLoader) {
         CodeGeneratorContext ctx = new CodeGeneratorContext(tableConfig, classLoader);
-        String processCode =
-                generateProcessCode(ctx, inputType, invocation, CodeGenUtils.DEFAULT_INPUT1_TERM());
+        ProcessCode processCode =
+                generateProcessCode(
+                        ctx, inputType, returnType, invocation, CodeGenUtils.DEFAULT_INPUT1_TERM());
         return FunctionCodeGenerator.generateFunction(
                 ctx,
                 name,
                 getFunctionClass(),
-                processCode,
+                processCode.bodyCode,
                 returnType,
                 inputType,
                 CodeGenUtils.DEFAULT_INPUT1_TERM(),
                 JavaScalaConversionUtil.toScala(Optional.empty()),
                 JavaScalaConversionUtil.toScala(Optional.empty()),
                 CodeGenUtils.DEFAULT_COLLECTOR_TERM(),
-                CodeGenUtils.DEFAULT_CONTEXT_TERM());
+                CodeGenUtils.DEFAULT_CONTEXT_TERM(),
+                JavaScalaConversionUtil.toScala(processCode.timeoutBodyCode));
     }
 
     @SuppressWarnings("unchecked")
@@ -67,8 +77,12 @@ public class AsyncCorrelateCodeGenerator {
         return (Class<AsyncFunction<RowData, Object>>) (Object) AsyncFunction.class;
     }
 
-    private static String generateProcessCode(
-            CodeGeneratorContext ctx, RowType inputType, RexCall invocation, String inputTerm) {
+    private static ProcessCode generateProcessCode(
+            CodeGeneratorContext ctx,
+            RowType inputType,
+            RowType returnType,
+            RexCall invocation,
+            String inputTerm) {
         invocation.accept(new AsyncCorrelateFunctionsValidator());
 
         ExprCodeGenerator exprGenerator =
@@ -78,8 +92,39 @@ public class AsyncCorrelateCodeGenerator {
                                 inputTerm,
                                 JavaScalaConversionUtil.toScala(Optional.empty()));
 
-        GeneratedExpression invocationExprs = exprGenerator.generateExpression(invocation);
-        return invocationExprs.code();
+        // Generate operand expressions explicitly so we can call the timeout-aware helper below.
+        // Letting `generateExpression(invocation)` walk the call instead would route through
+        // BridgingSqlFunctionCallGen, which discards the optional `timeout(...)` call we need to
+        // render into the generated AsyncFunction subclass.
+        List<GeneratedExpression> operands = new ArrayList<>();
+        for (RexNode operand : invocation.getOperands()) {
+            operands.add(exprGenerator.generateExpression(operand));
+        }
+
+        Tuple3<GeneratedExpression, Option<GeneratedExpression>, DataType> result =
+                BridgingFunctionGenUtil.generateBridgingFunctionCallWithTimeout(
+                        ctx,
+                        invocation,
+                        null,
+                        JavaScalaConversionUtil.toScala(operands),
+                        returnType,
+                        false);
+
+        Option<GeneratedExpression> timeoutCall = result._2();
+        Optional<String> timeoutBodyCode =
+                timeoutCall.isDefined() ? Optional.of(timeoutCall.get().code()) : Optional.empty();
+        return new ProcessCode(result._1().code(), timeoutBodyCode);
+    }
+
+    /** Pair of generated bodies for the eval (asyncInvoke) and optional timeout methods. */
+    private static final class ProcessCode {
+        final String bodyCode;
+        final Optional<String> timeoutBodyCode;
+
+        ProcessCode(String bodyCode, Optional<String> timeoutBodyCode) {
+            this.bodyCode = bodyCode;
+            this.timeoutBodyCode = timeoutBodyCode;
+        }
     }
 
     private static class AsyncCorrelateFunctionsValidator extends RexVisitorImpl<Void> {
