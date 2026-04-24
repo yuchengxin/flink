@@ -23,13 +23,13 @@ import org.apache.flink.table.annotation.DataTypeHint;
 import org.apache.flink.table.annotation.FunctionHint;
 import org.apache.flink.table.catalog.DataTypeFactory;
 import org.apache.flink.table.connector.source.LookupTableSource;
-import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.extraction.TypeInferenceExtractor;
 import org.apache.flink.table.types.inference.TypeInference;
 import org.apache.flink.types.Row;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Base class for a user-defined asynchronous table function. A user-defined asynchronous table
@@ -72,32 +72,66 @@ import java.util.concurrent.CompletableFuture;
  * An error can also be propagated to the async IO operator by calling {@link
  * CompletableFuture#completeExceptionally(Throwable)}.
  *
+ * <p>Optionally, a custom timeout handler can be defined by convention. A timeout method must be
+ * declared publicly, not static, and named <code>timeout</code>. Its parameter list mirrors the
+ * matching <code>eval</code> method: the first parameter is a {@link CompletableFuture} (with the
+ * same generic type as in <code>eval</code>) and the remaining parameters are the lookup keys.
+ * Timeout methods can also be overloaded by implementing multiple methods named <code>timeout
+ * </code>, one for each <code>eval</code> overload that should support timeout handling. When an
+ * async invocation exceeds the configured timeout, the framework invokes the matching <code>
+ * timeout</code> method to allow the function to supply a fallback result via {@link
+ * CompletableFuture#complete} or to propagate an error via {@link
+ * CompletableFuture#completeExceptionally(Throwable)}. The timeout handler must complete the future
+ * <em>synchronously</em>; performing another asynchronous operation (e.g. retrying or issuing
+ * another remote call) inside the timeout handler is not allowed. If no <code>timeout
+ * </code> method is provided, a {@link TimeoutException} is raised by default.
+ *
+ * <p>If a <code>timeout</code> method exists with valid visibility but its parameter list is not
+ * compatible with the current call site's lookup key types, the framework fails fast during
+ * planning (code generation) with a {@link org.apache.flink.table.api.ValidationException} whose
+ * message includes the function's fully qualified class name, the expected signature, and the
+ * actual signatures found. Any exception thrown from inside a <code>timeout</code> body propagates
+ * to the operator as the cause of the surfaced {@link TimeoutException}.
+ *
  * <p>For storing a user-defined function in a catalog, the class must have a default constructor
  * and must be instantiable during runtime. Anonymous functions in Table API can only be persisted
  * if the function is not stateful (i.e. containing only transient and static fields).
  *
- * <p>The following example shows how to perform an asynchronous request to Apache HBase:
+ * <p>The following example shows how to perform an asynchronous remote model invocation, with a
+ * fallback handler provided via the <code>timeout</code> convention:
  *
  * <pre>{@code
- * public class HBaseAsyncTableFunction extends AsyncTableFunction<Row> {
+ * public class RemoteModelAsyncTableFunction extends AsyncTableFunction<RowData> {
+ *
+ *   private transient RemoteModelClient client;
+ *
+ *   public void open(FunctionContext context) {
+ *     client = new RemoteModelClient(...);
+ *   }
  *
  *   // implement an "eval" method that takes a CompletableFuture as the first parameter
  *   // and ends with as many parameters as you want
- *   public void eval(CompletableFuture<Collection<Row>> result, String rowkey) {
- *     Get get = new Get(Bytes.toBytes(rowkey));
- *     ListenableFuture<Result> future = hbase.asyncGet(get);
- *     Futures.addCallback(future, new FutureCallback<Result>() {
- *       public void onSuccess(Result hbaseResult) {
- *         List<Row> ret = process(hbaseResult);
- *         result.complete(ret);
- *       }
- *       public void onFailure(Throwable thrown) {
- *         result.completeExceptionally(thrown);
+ *   public void eval(CompletableFuture<Collection<RowData>> result, String prompt) {
+ *     CompletableFuture<String> modelFuture = client.predictAsync(prompt);
+ *     modelFuture.whenComplete((response, throwable) -> {
+ *       if (throwable != null) {
+ *         result.completeExceptionally(throwable);
+ *       } else {
+ *         result.complete(
+ *             Collections.singletonList(GenericRowData.of(StringData.fromString(response))));
  *       }
  *     });
  *   }
  *
- *   // you can overload the eval method here ...
+ *   // implement a "timeout" method whose parameter list mirrors the matching "eval" method
+ *   // to provide a fallback result when the remote model call exceeds the configured timeout;
+ *   // the future must be completed synchronously, no further async operations are allowed
+ *   public void timeout(CompletableFuture<Collection<RowData>> result, String prompt) {
+ *     result.complete(
+ *         Collections.singletonList(GenericRowData.of(StringData.fromString("FALLBACK"))));
+ *   }
+ *
+ *   // you can overload the eval/timeout methods here ...
  * }
  * }</pre>
  *

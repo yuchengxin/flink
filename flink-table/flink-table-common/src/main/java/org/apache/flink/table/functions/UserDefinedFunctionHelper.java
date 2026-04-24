@@ -97,6 +97,8 @@ public final class UserDefinedFunctionHelper {
 
     public static final String ASYNC_TABLE_EVAL = "eval";
 
+    public static final String ASYNC_TABLE_TIMEOUT = "timeout";
+
     public static final String PROCESS_TABLE_EVAL = "eval";
 
     public static final String PROCESS_TABLE_ON_TIMER = "onTimer";
@@ -349,6 +351,94 @@ public final class UserDefinedFunctionHelper {
                             ExtractionUtils.createMethodSignatureString(
                                     methodName, argumentClasses, outputClass)));
         }
+    }
+
+    /**
+     * Validates whether an {@link AsyncTableFunction} subclass declares a usable {@code timeout}
+     * fallback method that mirrors the {@code eval(CompletableFuture, ...)} signature.
+     *
+     * <p>The detection uses a three-step contract: collect every method literally named {@code
+     * timeout} via {@link ExtractionUtils#collectMethods}, filter to those that are both {@code
+     * public} and non-{@code static}, and finally verify the surviving candidates against the
+     * expected {@code (CompletableFuture<Collection<T>>, argumentClasses)} signature.
+     *
+     * <ul>
+     *   <li>No applicable candidate (none declared, or all private/static/mis-spelled) — returns
+     *       {@code false}; the framework falls back to {@link
+     *       java.util.concurrent.TimeoutException} via the default {@code AsyncFunction#timeout}.
+     *   <li>One or more applicable candidates with a matching signature — returns {@code true};
+     *       codegen will emit a {@code fetcher.timeout(...)} dispatch.
+     *   <li>One or more applicable candidates but signature mismatch — throws {@link
+     *       ValidationException} eagerly with the FQN, the expected signature, and every actual
+     *       candidate signature so users can locate the offending method quickly.
+     * </ul>
+     */
+    public static boolean validateAsyncTableFunctionTimeoutClass(
+            Class<? extends UserDefinedFunction> functionClass,
+            Class<?>[] argumentClasses,
+            String functionName) {
+        final List<Method> candidates =
+                ExtractionUtils.collectMethods(functionClass, ASYNC_TABLE_TIMEOUT);
+        final List<Method> applicable =
+                candidates.stream()
+                        .filter(
+                                method ->
+                                        Modifier.isPublic(method.getModifiers())
+                                                && !Modifier.isStatic(method.getModifiers()))
+                        .collect(Collectors.toList());
+        if (applicable.isEmpty()) {
+            return false;
+        }
+        // Mirror the eval convention: prepend the implicit CompletableFuture parameter so the
+        // full expected signature is `timeout(CompletableFuture, argumentClasses...)`.
+        final Class<?>[] expectedSignature = new Class<?>[argumentClasses.length + 1];
+        expectedSignature[0] = CompletableFuture.class;
+        System.arraycopy(argumentClasses, 0, expectedSignature, 1, argumentClasses.length);
+        try {
+            validateClassForRuntime(
+                    functionClass,
+                    ASYNC_TABLE_TIMEOUT,
+                    expectedSignature,
+                    void.class,
+                    functionName);
+        } catch (ValidationException originalException) {
+            throw new ValidationException(
+                    buildTimeoutSignatureMismatchMessage(
+                            functionClass, expectedSignature, applicable),
+                    originalException);
+        }
+        return true;
+    }
+
+    private static String buildTimeoutSignatureMismatchMessage(
+            Class<? extends UserDefinedFunction> functionClass,
+            Class<?>[] argumentClasses,
+            List<Method> applicable) {
+        final StringBuilder builder = new StringBuilder();
+        builder.append("Could not find a public, non-static `timeout(")
+                .append(formatSignature(argumentClasses))
+                .append(")` method in class ")
+                .append(functionClass.getName())
+                .append(".\nExisting public timeout methods:");
+        for (Method method : applicable) {
+            builder.append("\n  - public ");
+            if (Modifier.isFinal(method.getModifiers())) {
+                builder.append("final ");
+            }
+            builder.append(method.getReturnType().getName())
+                    .append(' ')
+                    .append(functionClass.getName())
+                    .append('.')
+                    .append(method.getName())
+                    .append('(')
+                    .append(formatSignature(method.getParameterTypes()))
+                    .append(')');
+        }
+        return builder.toString();
+    }
+
+    private static String formatSignature(Class<?>[] argumentClasses) {
+        return Arrays.stream(argumentClasses).map(Class::getName).collect(Collectors.joining(", "));
     }
 
     /**

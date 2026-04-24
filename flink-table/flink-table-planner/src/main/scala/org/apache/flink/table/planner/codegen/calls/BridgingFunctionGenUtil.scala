@@ -97,6 +97,40 @@ object BridgingFunctionGenUtil {
       udf: UserDefinedFunction,
       functionName: String,
       skipIfArgsNull: Boolean): (GeneratedExpression, DataType) = {
+    val result = generateFunctionAwareCallWithDataTypeAndTimeout(
+      ctx,
+      operands,
+      returnType,
+      inference,
+      callContext,
+      udf,
+      functionName,
+      skipIfArgsNull)
+    (result._1, result._3)
+  }
+
+  /**
+   * Like [[generateFunctionAwareCallWithDataType]] but additionally returns an optional
+   * timeout-call expression when the UDF is an [[AsyncTableFunction]] (or its
+   * [[org.apache.flink.table.functions.AsyncLookupFunction]] subclass) that declares a public,
+   * non-static `timeout(CompletableFuture, ...)` method whose parameter list matches the call site.
+   * When the user UDF does not declare such a method, the returned timeout-call is empty and the
+   * generated `AsyncFunction` falls back to the framework default that completes the future with a
+   * [[java.util.concurrent.TimeoutException]].
+   *
+   * <p>An illegal `timeout` signature (e.g., parameter count or types incompatible with the lookup
+   * keys) triggers a [[org.apache.flink.table.api.ValidationException]] that bubbles up to fail the
+   * job at submit / operator init time, so misconfigurations never reach the data path.
+   */
+  def generateFunctionAwareCallWithDataTypeAndTimeout(
+      ctx: CodeGeneratorContext,
+      operands: Seq[GeneratedExpression],
+      returnType: LogicalType,
+      inference: TypeInference,
+      callContext: CallContext,
+      udf: UserDefinedFunction,
+      functionName: String,
+      skipIfArgsNull: Boolean): (GeneratedExpression, Option[GeneratedExpression], DataType) = {
 
     // enrich argument types with conversion class
     val castCallContext = TypeInferenceUtil.castArguments(inference, callContext, null)
@@ -114,33 +148,45 @@ object BridgingFunctionGenUtil {
       enrichedOutputDataType,
       udf,
       functionName)
-    val call = generateFunctionAwareCall(
+
+    val functionTerm = ctx.addReusableFunction(udf)
+    val externalOperands = prepareExternalOperands(ctx, operands, enrichedArgumentDataTypes)
+
+    val call = generateFunctionAwareCallFromPreparedOperands(
       ctx,
-      operands,
-      enrichedArgumentDataTypes,
+      functionTerm,
+      externalOperands,
       enrichedOutputDataType,
       returnType,
       udf,
       skipIfArgsNull,
       None)
-    (call, enrichedOutputDataType)
+
+    val timeoutCall = if (udf.getKind == FunctionKind.ASYNC_TABLE) {
+      generateAsyncTableFunctionTimeoutCall(
+        udf,
+        functionName,
+        enrichedArgumentDataTypes,
+        functionTerm,
+        externalOperands,
+        returnType,
+        enrichedOutputDataType,
+        skipIfArgsNull)
+    } else {
+      None
+    }
+    (call, timeoutCall, enrichedOutputDataType)
   }
 
-  private def generateFunctionAwareCall(
+  private def generateFunctionAwareCallFromPreparedOperands(
       ctx: CodeGeneratorContext,
-      operands: Seq[GeneratedExpression],
-      argumentDataTypes: Seq[DataType],
+      functionTerm: String,
+      externalOperands: Seq[GeneratedExpression],
       outputDataType: DataType,
       returnType: LogicalType,
       udf: UserDefinedFunction,
       skipIfArgsNull: Boolean,
       contextTerm: Option[String]): GeneratedExpression = {
-
-    val functionTerm = ctx.addReusableFunction(udf)
-
-    // operand conversion
-    val externalOperands = prepareExternalOperands(ctx, operands, argumentDataTypes)
-
     if (udf.getKind == FunctionKind.TABLE || udf.getKind == FunctionKind.PROCESS_TABLE) {
       generateTableFunctionCall(
         ctx,
@@ -167,6 +213,59 @@ object BridgingFunctionGenUtil {
         outputDataType)
     } else {
       generateScalarFunctionCall(ctx, functionTerm, externalOperands, outputDataType)
+    }
+  }
+
+  /**
+   * Generates the body of the `timeout(...)` method that is rendered into a codegen
+   * `RichAsyncFunction` subclass when the user UDF declares a legal `timeout` method. Mirrors
+   * [[generateAsyncTableFunctionCall]] except the generated code invokes `function.timeout(...)`
+   * instead of `function.eval(...)` and reuses the SAME UDF instance registered by the eval path
+   * (see contracts/codegen-fetcher-timeout.md §2.1).
+   */
+  private def generateAsyncTableFunctionTimeoutCall(
+      udf: UserDefinedFunction,
+      functionName: String,
+      enrichedArgumentDataTypes: Seq[DataType],
+      functionTerm: String,
+      externalOperands: Seq[GeneratedExpression],
+      returnType: LogicalType,
+      outputDataType: DataType,
+      skipIfArgsNull: Boolean): Option[GeneratedExpression] = {
+    val argumentClasses = enrichedArgumentDataTypes.map(_.getConversionClass).toArray
+    val hasTimeout =
+      validateAsyncTableFunctionTimeoutClass(udf.getClass, argumentClasses, functionName)
+    if (!hasTimeout) {
+      None
+    } else {
+      val DELEGATE_ASYNC_TABLE = className[DelegatingAsyncTableResultFuture]
+      val outputType = outputDataType.getLogicalType
+      val needsWrapping = !isCompositeType(outputType)
+      val isInternal = DataTypeUtils.isInternal(outputDataType)
+      val functionCallCode = if (skipIfArgsNull) {
+        s"""
+           |${externalOperands.map(_.code).mkString("\n")}
+           |if (${externalOperands.map(_.nullTerm).mkString(" || ")}) {
+           |  $DEFAULT_COLLECTOR_TERM.complete(java.util.Collections.emptyList());
+           |} else {
+           |  $DELEGATE_ASYNC_TABLE delegates = new $DELEGATE_ASYNC_TABLE($DEFAULT_COLLECTOR_TERM,
+           |      $needsWrapping, $isInternal);
+           |  $functionTerm.timeout(
+           |    delegates.getCompletableFuture(),
+           |    ${externalOperands.map(_.resultTerm).mkString(", ")});
+           |}
+           |""".stripMargin
+      } else {
+        s"""
+           |${externalOperands.map(_.code).mkString("\n")}
+           |$DELEGATE_ASYNC_TABLE delegates = new $DELEGATE_ASYNC_TABLE($DEFAULT_COLLECTOR_TERM,
+           |      $needsWrapping, $isInternal);
+           |$functionTerm.timeout(
+           |    delegates.getCompletableFuture(),
+           |    ${externalOperands.map(_.resultTerm).mkString(", ")});
+           |""".stripMargin
+      }
+      Some(GeneratedExpression(NO_CODE, NEVER_NULL, functionCallCode, returnType))
     }
   }
 

@@ -59,7 +59,8 @@ public class AsyncCorrelateCodeGenerator {
                 JavaScalaConversionUtil.toScala(Optional.empty()),
                 JavaScalaConversionUtil.toScala(Optional.empty()),
                 CodeGenUtils.DEFAULT_COLLECTOR_TERM(),
-                CodeGenUtils.DEFAULT_CONTEXT_TERM());
+                CodeGenUtils.DEFAULT_CONTEXT_TERM(),
+                JavaScalaConversionUtil.toScala(Optional.<String>empty()));
     }
 
     @SuppressWarnings("unchecked")

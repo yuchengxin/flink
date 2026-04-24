@@ -22,6 +22,7 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.catalog.CatalogFunction;
 import org.apache.flink.table.catalog.FunctionLanguage;
+import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.resource.ResourceUri;
 import org.apache.flink.util.Collector;
 
@@ -43,6 +44,7 @@ import static org.apache.flink.core.testutils.FlinkAssertions.anyCauseMatches;
 import static org.apache.flink.table.functions.UserDefinedFunctionHelper.instantiateFunction;
 import static org.apache.flink.table.functions.UserDefinedFunctionHelper.isClassNameSerializable;
 import static org.apache.flink.table.functions.UserDefinedFunctionHelper.prepareInstance;
+import static org.apache.flink.table.functions.UserDefinedFunctionHelper.validateAsyncTableFunctionTimeoutClass;
 import static org.apache.flink.table.functions.UserDefinedFunctionHelper.validateClass;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -99,6 +101,89 @@ class UserDefinedFunctionHelperTest {
         } else {
             runnable.run();
         }
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Tests for validateAsyncTableFunctionTimeoutClass (T017 / T020)
+    // --------------------------------------------------------------------------------------------
+
+    /** US2 (T017): absent / private / static / misspelled timeout methods return false. */
+    @Test
+    void testValidateAsyncTimeoutReturnsFalseWhenNoApplicableMethod() {
+        final Class<?>[] argumentClasses = new Class<?>[] {Integer.class};
+
+        assertThat(
+                        validateAsyncTableFunctionTimeoutClass(
+                                NoTimeoutAsyncTableFunction.class, argumentClasses, "f"))
+                .isFalse();
+        assertThat(
+                        validateAsyncTableFunctionTimeoutClass(
+                                PrivateTimeoutAsyncTableFunction.class, argumentClasses, "f"))
+                .isFalse();
+        assertThat(
+                        validateAsyncTableFunctionTimeoutClass(
+                                StaticTimeoutAsyncTableFunction.class, argumentClasses, "f"))
+                .isFalse();
+        assertThat(
+                        validateAsyncTableFunctionTimeoutClass(
+                                MisspelledTimeoutAsyncTableFunction.class, argumentClasses, "f"))
+                .isFalse();
+    }
+
+    /** US3 (T020): matching signature returns true. */
+    @Test
+    void testValidateAsyncTimeoutAcceptsMatchingSignature() {
+        final Class<?>[] argumentClasses = new Class<?>[] {Integer.class};
+        assertThat(
+                        validateAsyncTableFunctionTimeoutClass(
+                                ValidTimeoutAsyncTableFunction.class, argumentClasses, "f"))
+                .isTrue();
+    }
+
+    /** US3 (T020): wrong arg count fails fast with FQN + expected + actual signature. */
+    @Test
+    void testValidateAsyncTimeoutRejectsWrongArgCount() {
+        final Class<?>[] argumentClasses = new Class<?>[] {Integer.class, String.class};
+        assertThatThrownBy(
+                        () ->
+                                validateAsyncTableFunctionTimeoutClass(
+                                        WrongArgCountTimeoutAsyncTableFunction.class,
+                                        argumentClasses,
+                                        "f"))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining(WrongArgCountTimeoutAsyncTableFunction.class.getName())
+                .hasMessageContaining(Integer.class.getName())
+                .hasMessageContaining(String.class.getName());
+    }
+
+    /** US3 (T020): wrong arg type fails fast with FQN + expected + actual signature. */
+    @Test
+    void testValidateAsyncTimeoutRejectsWrongArgType() {
+        final Class<?>[] argumentClasses = new Class<?>[] {Integer.class};
+        assertThatThrownBy(
+                        () ->
+                                validateAsyncTableFunctionTimeoutClass(
+                                        WrongArgTypeTimeoutAsyncTableFunction.class,
+                                        argumentClasses,
+                                        "f"))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining(WrongArgTypeTimeoutAsyncTableFunction.class.getName())
+                .hasMessageContaining(Integer.class.getName())
+                .hasMessageContaining(String.class.getName());
+    }
+
+    /** US3 (T020): first arg not CompletableFuture fails fast. */
+    @Test
+    void testValidateAsyncTimeoutRejectsMissingFutureArg() {
+        final Class<?>[] argumentClasses = new Class<?>[] {Integer.class};
+        assertThatThrownBy(
+                        () ->
+                                validateAsyncTableFunctionTimeoutClass(
+                                        NoFutureTimeoutAsyncTableFunction.class,
+                                        argumentClasses,
+                                        "f"))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining(NoFutureTimeoutAsyncTableFunction.class.getName());
     }
 
     @Test
@@ -467,5 +552,64 @@ class UserDefinedFunctionHelperTest {
         public String eval() {
             return state;
         }
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // AsyncTableFunction subclasses used by validateAsyncTableFunctionTimeoutClass tests
+    // --------------------------------------------------------------------------------------------
+
+    /** No timeout method declared. */
+    public static class NoTimeoutAsyncTableFunction extends AsyncTableFunction<RowData> {
+        public void eval(CompletableFuture<Collection<RowData>> future, Integer key) {}
+    }
+
+    /** Private timeout — must be ignored. */
+    public static class PrivateTimeoutAsyncTableFunction extends AsyncTableFunction<RowData> {
+        public void eval(CompletableFuture<Collection<RowData>> future, Integer key) {}
+
+        private void timeout(CompletableFuture<Collection<RowData>> future, Integer key) {}
+    }
+
+    /** Static timeout — must be ignored. */
+    public static class StaticTimeoutAsyncTableFunction extends AsyncTableFunction<RowData> {
+        public void eval(CompletableFuture<Collection<RowData>> future, Integer key) {}
+
+        public static void timeout(CompletableFuture<Collection<RowData>> future, Integer key) {}
+    }
+
+    /** Method name misspelled — must be ignored. */
+    public static class MisspelledTimeoutAsyncTableFunction extends AsyncTableFunction<RowData> {
+        public void eval(CompletableFuture<Collection<RowData>> future, Integer key) {}
+
+        public void timout(CompletableFuture<Collection<RowData>> future, Integer key) {}
+    }
+
+    /** Valid timeout signature matching argumentClasses. */
+    public static class ValidTimeoutAsyncTableFunction extends AsyncTableFunction<RowData> {
+        public void eval(CompletableFuture<Collection<RowData>> future, Integer key) {}
+
+        public void timeout(CompletableFuture<Collection<RowData>> future, Integer key) {}
+    }
+
+    /** Timeout exists but accepts wrong number of args. */
+    public static class WrongArgCountTimeoutAsyncTableFunction extends AsyncTableFunction<RowData> {
+        public void eval(
+                CompletableFuture<Collection<RowData>> future, Integer key1, String key2) {}
+
+        public void timeout(CompletableFuture<Collection<RowData>> future, Integer key) {}
+    }
+
+    /** Timeout exists but accepts wrong arg type. */
+    public static class WrongArgTypeTimeoutAsyncTableFunction extends AsyncTableFunction<RowData> {
+        public void eval(CompletableFuture<Collection<RowData>> future, Integer key) {}
+
+        public void timeout(CompletableFuture<Collection<RowData>> future, String key) {}
+    }
+
+    /** Timeout first arg is not CompletableFuture. */
+    public static class NoFutureTimeoutAsyncTableFunction extends AsyncTableFunction<RowData> {
+        public void eval(CompletableFuture<Collection<RowData>> future, Integer key) {}
+
+        public void timeout(Integer key) {}
     }
 }
